@@ -1,21 +1,21 @@
+#!/usr/bin/env python3
 from csv import DictWriter
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 from gpiozero import Button
 import logging
-import os
-import pathlib
+from os import fsync, rename, name
+from pathlib import Path
 import pynmea2
-import serial
+from serial import Serial
 from threading import Thread, Event, Lock
-import time
-import yaml
+from time import perf_counter, sleep, time
+from yaml import safe_load, YAMLError
 from zoneinfo import ZoneInfo
 
 
-# TODO: Make multithreading more robust, use locks to access and modify global variables
-# TODO: Add command for printing the latest N lines from the data or diagnostic files
+# TODO: Get more of the global variables from the config file
 # TODO: Use prompt_toolkit for better command line interface (input prompt below live output)
 
 
@@ -40,12 +40,12 @@ class SafeDictWriter(DictWriter):
     def writeheader(self):
         super().writeheader()
         self.file.flush()
-        os.fsync(self.file.fileno())
+        fsync(self.file.fileno())
 
     def writerow(self, data):
         super().writerow(data)
         self.file.flush()
-        os.fsync(self.file.fileno())
+        fsync(self.file.fileno())
 
     def close(self):
         self.file.close()
@@ -55,7 +55,7 @@ class FlushFileHandler(logging.FileHandler):
     def emit(self, record):
         super().emit(record)
         self.flush()
-        os.fsync(self.stream.fileno())
+        fsync(self.stream.fileno())
 
 # Encapsulates the GPS report data
 @dataclass(frozen=True)
@@ -82,8 +82,9 @@ class SQMReading:
 
 
 # Constants
-CONFIG_FILE_PATH = pathlib.Path(__file__).resolve().parent / "config.yaml"
-DATA_FILE_HEADER = ["time_utc",
+CONFIG_FILE_PATH = Path(__file__).resolve().parent / "config.yaml"
+DATA_FILE_HEADER = ["trigger_id",
+                    "time_utc",
                     "time_local",
                     "latitude",
                     "longitude",
@@ -99,7 +100,8 @@ DATA_FILE_HEADER = ["time_utc",
 
 # Variables
 DATA_FILE_PATH = "" # Will be renamed with GPS timestamp once GPS fix is acquired
-DIAGNOSTIC_FILE_PATH = pathlib.Path(__file__).resolve().parent / "diagnostics" / f"temp.log" # Temporary filename, will be renamed with GPS timestamp once GPS fix is acquired
+DIAGNOSTIC_FILE_PATH = Path(__file__).resolve().parent / "diagnostics" / f"temp.log" # Temporary filename, will be renamed with GPS timestamp once GPS fix is acquired
+trigger_id = 0  # Unique ID for each trigger event, incremented on each trigger
 measurements_per_trigger = 1  # Default number of measurements per trigger
 measurement_interval = 0  # Default interval between measurements in seconds
 extra_measurement = True # Flag to indicate if an extra sqm measurement should be taken in order to account for the temperature error
@@ -117,7 +119,7 @@ def is_number(n):
     try:
         int(n)
         return True
-    except e:
+    except ValueError:
         return False
 
 
@@ -135,9 +137,9 @@ def wait_for_gps_fix(gps_serial, timeout=120):
     Returns True if fix is obtained within timeout, else False.
     """
     gps_serial.reset_input_buffer()
-    start_time = time.time()
+    start_time = time()
 
-    while time.time() - start_time < timeout:
+    while time() - start_time < timeout:
         try:
             line = gps_serial.readline().decode(errors='ignore').strip()
 
@@ -159,7 +161,7 @@ def wait_for_gps_fix(gps_serial, timeout=120):
             log.critical(f"Unexpected error while waiting for GPS fix: {ex}")
             raise ex
 
-        time.sleep(1)  # Avoid hammering the CPU
+        sleep(1)  # Avoid hammering the CPU
 
     log.critical("GPS fix not acquired.")
     raise Exception("GPS fix not acquired")
@@ -255,30 +257,38 @@ def get_sqm_reading() -> SQMReading:
 def toggle_trigger_behavior():
     """Toggle the trigger behavior between SINGLE and TOGGLE_CONTINUOUS."""
     global trigger_behavior
-    if trigger_behavior == TriggerBehavior.SINGLE:
-        trigger_behavior = TriggerBehavior.TOGGLE_CONTINUOUS
-        log.info("Trigger behavior set to toggle continuous mode.")
-    else:
-        trigger_behavior = TriggerBehavior.SINGLE
-        log.info("Trigger behavior set to single measurement.")
-    print(f"Trigger behavior set to {trigger_behavior.name}.")
+
+    with logging_lock:
+        if trigger_behavior == TriggerBehavior.SINGLE:
+            trigger_behavior = TriggerBehavior.TOGGLE_CONTINUOUS
+            log.info("Trigger behavior set to toggle continuous mode.")
+        else:
+            trigger_behavior = TriggerBehavior.SINGLE
+            log.info("Trigger behavior set to single measurement.")
+        print(f"Trigger behavior set to {trigger_behavior.name}.")
 
 
 def log_measurement():
-    start_time = time.perf_counter()
+    global data_file_writer, trigger_id
+
+    with logging_lock:
+        tr_id = trigger_id
+
+    start_time = perf_counter()
     gps_report = get_gps_data()
-    end_gps_report_time = time.perf_counter()
+    end_gps_time = perf_counter()
     sqm_reading = get_sqm_reading()
-    end_sqm_report_time = time.perf_counter()
-    data = {"time_utc" : gps_report.time_utc,
+    end_sqm_time = perf_counter()
+    data = {"trigger_id" : tr_id,
+            "time_utc" : gps_report.time_utc,
             "time_local" : gps_report.time_local,
             "latitude" : gps_report.latitude,
             "longitude" : gps_report.longitude,
             "altitude" : gps_report.altitude,
             "speed" : gps_report.speed,
             "satellites" : gps_report.satellites,
-            "gps_time" : f"{(end_gps_report_time - start_time):.4f}",
-            "sqm_time" : f"{(end_sqm_report_time - end_gps_report_time):.4f}",
+            "gps_time" : f"{(end_gps_time - start_time):.4f}",
+            "sqm_time" : f"{(end_sqm_time - end_gps_time):.4f}",
             "temperature" : sqm_reading.temperature,
             "count" : sqm_reading.count,
             "frequency" : sqm_reading.frequency,
@@ -289,36 +299,49 @@ def log_measurement():
 
 
 def logging_worker():
-    global logging_active
+    global logging_active, extra_measurement, measurements_per_trigger, measurement_interval, trigger_behavior, trigger_id
     while True:
         logging_event.wait()
 
-        while logging_active:
-            if extra_measurement: # If extra measurement is enabled, take an additional SQM reading before the main measurements
+        while True:
+            with logging_lock:
+                la = logging_active
+                em = extra_measurement
+                mpt = measurements_per_trigger
+                mi = measurement_interval
+                tb = trigger_behavior
+
+            if not la:
+                break
+
+            if em: # If extra measurement is enabled, take an additional SQM reading before the main measurements
                 _ = get_sqm_reading()
 
-            for i in range(measurements_per_trigger):
+            for _ in range(mpt):
                 log_measurement()
-                if i > 0 and measurement_interval > 0:
-                    time.sleep(measurement_interval)
+                sleep(mi)
 
-            if trigger_behavior == TriggerBehavior.SINGLE:
-                logging_active = False
+            with logging_lock:
+                trigger_id += 1
+
+            if tb == TriggerBehavior.SINGLE:
+                with logging_lock:
+                    logging_active = False
                 break
 
         logging_event.clear()
 
 
 def handle_trigger():
-    """Callback function for button press to trigger logging."""
     global trigger_behavior, logging_active
 
-    if trigger_behavior == TriggerBehavior.SINGLE:
-        logging_active = True
-        logging_event.set()
-    elif trigger_behavior == TriggerBehavior.TOGGLE_CONTINUOUS:
-        logging_active = not logging_active
-        logging_event.set()
+    with logging_lock:
+        if trigger_behavior == TriggerBehavior.SINGLE:
+            logging_active = True
+            logging_event.set()
+        elif trigger_behavior == TriggerBehavior.TOGGLE_CONTINUOUS:
+            logging_active = not logging_active
+            logging_event.set()
 
 
 # === SETUP ===
@@ -335,11 +358,11 @@ log.addHandler(log_handler)
 # Open the configuration file
 try:
     with open(CONFIG_FILE_PATH, "r") as rpi_conf_file:
-        config_file = yaml.safe_load(rpi_conf_file)
+        config_file = safe_load(rpi_conf_file)
     log.info("Successfully loaded configuration file")
 except FileNotFoundError:
     log.critical(f"{CONFIG_FILE_PATH} not found. Please ensure the configuration file exists.")
-except yaml.YAMLError as e:
+except YAMLError as e:
     log.critical(f"Error parsing config.yaml: {e}")
 except Exception as e:
     log.critical(f"Unexpected error reading config.yaml: {e}")
@@ -376,7 +399,7 @@ measurement_interval = config_file.get("measurement_interval")
 log.info(f"Measurements interval set to {measurement_interval} seconds based on configuration file")
 
 # Initialize the button trigger (only on raspberry pi)
-if is_raspberry_pi_os():
+if config_file.get("trigger_button_gpio_pin") != "NONE":
     try:
         button = Button(config_file.get("trigger_button_gpio_pin"), pull_up=True, bounce_time=0.25)
         button.when_pressed = lambda: handle_trigger()
@@ -388,7 +411,7 @@ if is_raspberry_pi_os():
 
 # Initialize the SQM serial port
 try:
-    sqm = serial.Serial(config_file.get("sqm_serial_port"), baudrate=115200, timeout=30)
+    sqm = Serial(config_file.get("sqm_serial_port"), baudrate=115200, timeout=30)
     sqm.flush()  # Clear any existing data in the input buffer
     log.info(f"Successfully opened SQM serial port {config_file.get('sqm_serial_port')}")
 except Exception as e:
@@ -397,7 +420,7 @@ except Exception as e:
 
 # Initialize the GPS serial port
 try:
-    gps = serial.Serial(config_file.get("gps_serial_port"), baudrate=4800, timeout=2)
+    gps = Serial(config_file.get("gps_serial_port"), baudrate=4800, timeout=2)
     log.info(f"Successfully opened GPS serial port {config_file.get('gps_serial_port')}")
 except Exception as e:
     log.critical(f"Unexpected error opening GPS serial port: {e}")
@@ -417,7 +440,7 @@ except Exception as e:
 # Rename the data file path
 try:
     # The data file hasn't been created yet, so just set the path to the new name
-    new_datafile_path = pathlib.Path(__file__).resolve().parent / "data" / f"{program_start_time}.csv"
+    new_datafile_path = Path(__file__).resolve().parent / "data" / f"{program_start_time}.csv"
     DATA_FILE_PATH = new_datafile_path
     log.info(f"Data file path created: {DATA_FILE_PATH}")
 except Exception as e:
@@ -426,14 +449,14 @@ except Exception as e:
 
 # Rename the diagnostic file path
 try:
-    new_diagnostic_file_path = pathlib.Path(__file__).resolve().parent / "diagnostics" / f"{program_start_time}.log"
+    new_diagnostic_file_path = Path(__file__).resolve().parent / "diagnostics" / f"{program_start_time}.log"
 
     # Close the old handler and rename the file
     log.removeHandler(log_handler)
     log_handler.close()
 
     # Rename the diagnostic file
-    os.rename(DIAGNOSTIC_FILE_PATH, new_diagnostic_file_path)
+    rename(DIAGNOSTIC_FILE_PATH, new_diagnostic_file_path)
     DIAGNOSTIC_FILE_PATH = new_diagnostic_file_path
 
     # Recreate the handler with the new file path
@@ -479,25 +502,39 @@ def main():
             elif cmd.strip().lower() == 'm': # m for mode switch
                 toggle_trigger_behavior()
             elif cmd.strip().lower() == 'x': # x for extra measurement
-                extra_measurement = not extra_measurement
+                with logging_lock:
+                    extra_measurement = not extra_measurement
+                    log.info(f"Extra measurement set to {'enabled' if extra_measurement else 'disabled'}")
+                    print(f"Extra measurement {'enabled' if extra_measurement else 'disabled'}")
             elif cmd.strip().lower() == 'q':
                 log.info("User requested to quit the program.")
                 print("Exiting program...")
                 break
             elif cmd.strip().lower().startswith('n') and is_number(cmd.strip()[1:]):
-                measurements_per_trigger = int(cmd.strip()[1:])
-                log.info(f"User set measurements per trigger to {measurements_per_trigger}")
-                print(f"Measurements per trigger set to {measurements_per_trigger}")
+                with logging_lock:
+                    measurements_per_trigger = int(cmd.strip()[1:])
+                    log.info(f"User set measurements per trigger to {measurements_per_trigger}")
+                    print(f"Measurements per trigger set to {measurements_per_trigger}")
             elif cmd.strip().lower().startswith('i') and is_number(cmd.strip()[1:]) and int(cmd.strip()[1:]) >= 0:
-                measurement_interval = int(cmd.strip()[1:])
-                log.info(f"User set measurements interval to {measurement_interval} seconds")
-                print(f"Measurements interval set to {measurement_interval} seconds")
+                with logging_lock:
+                    measurement_interval = int(cmd.strip()[1:])
+                    log.info(f"User set measurements interval to {measurement_interval} seconds")
+                    print(f"Measurements interval set to {measurement_interval} seconds")
+            elif cmd.strip().lower().startswith('data') and is_number(cmd.strip()[4:]): # Print the last N lines of the data file
+                with open(DATA_FILE_PATH, "r", newline="") as read_file:
+                    lines = "".join(read_file.readlines()[-int(cmd.strip()[4:]):]).replace(",", ", ")
+                print(lines)
+            elif cmd.strip().lower().startswith('diag') and is_number(cmd.strip()[4:]): # Print the last N lines of the data file
+                with open(DIAGNOSTIC_FILE_PATH, "r", newline="") as read_file:
+                    lines = "".join(read_file.readlines()[-int(cmd.strip()[4:]):]).replace(",", ", ")
+                print(lines)
             elif cmd.strip().lower() == 's': # s for settings
-                print(f"Measurements per trigger: {measurements_per_trigger}\n"
-                      f"Measurement interval: {measurement_interval} seconds\n"
-                      f"Extra measurement: {'Yes' if extra_measurement else 'No'}\n"
-                      f"Trigger behavior mode: {trigger_behavior}\n"
-                      f"Currently logging: {'Yes' if logging_event.is_set() else 'No'}")
+                with logging_lock:
+                    print(f"Measurements per trigger: {measurements_per_trigger}\n"
+                          f"Measurement interval: {measurement_interval} seconds\n"
+                          f"Extra measurement: {'Yes' if extra_measurement else 'No'}\n"
+                          f"Trigger behavior mode: {trigger_behavior}\n"
+                          f"Currently logging: {'Yes' if logging_event.is_set() else 'No'}")
             else:
                 print("Unknown command. Use one of the following:\n"
                       "t - trigger measurement\n"
@@ -505,6 +542,8 @@ def main():
                       "x - toggle extra measurement (to account for temperature error)\n"
                       "n<number> - set number of measurements per trigger\n"
                       "i<number> - set interval between measurements in seconds\n"
+                      "data<number> - print the last N lines from the data file\n"
+                      "diag<number> - print the last N lines from the diagnostic file\n"
                       "s - show current settings\n"
                       "q - quit the program")
     except KeyboardInterrupt:

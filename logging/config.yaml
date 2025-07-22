@@ -1,7 +1,9 @@
-trigger_button_gpio_pin: 18 # GPIO pin for the trigger button, e.g., 23
+trigger_button_gpio_pin: NONE # GPIO pin for the trigger button, e.g., 23
 sqm_serial_port: "COM3" # Serial port for the SQM device, e.g., COM3 on Windows or /dev/ttyUSB0 on Linux
 gps_serial_port: "COM4" # Serial port for the GPS device, e.g., COM4 on Windows or /dev/ttyUSB1 on Linux
 local_timezone: "America/Los_Angeles" # Local timezone from the IANA Time Zone Database
 measurements_per_trigger: 1 # Number of measurements to take per trigger, -1 for continuous mode
-measurement_interval: 5 # Interval between measurements in seconds
+measurement_interval: 0 # Interval between measurements in seconds
+extra_measurement: TRUE # Whether to take an extra measurement before the data collection (to bring sensor to stable temperature)
+trigger_behavior: "SINGLE" # Trigger behavior, can be "single" for one measurement per trigger or "toggle_continuous" to start/stop continuous measurement
 logging_level: "INFO" # Logging level, (DEBUG, INFO, WARNING, ERROR, CRITICAL). DEBUG is most informative, CRITICAL is least informative.
