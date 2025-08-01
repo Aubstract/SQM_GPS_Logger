@@ -1,0 +1,17 @@
+Data file columns:
+- trigger_id: unique identifier for the trigger
+- measurement_id: unique identifier for the measurement
+- time_utc: timestamp in UTC
+- time_local: timestamp in local time
+- latitude: latitude of the measurement location
+- longitude: longitude of the measurement location
+- altitude: altitude of the measurement location
+- speed: speed of the measurement
+- satellites: number of satellites used in the measurement
+- gps_time: time it took to get the GPS information
+- sqm_time: time it took to get the SQM information
+- temperature: internal temperature of the SQM
+- count: number of internal measurements
+- frequency: frequency of the SQM
+- period: period of the SQM
+- brightness: brightness level measured by the SQM

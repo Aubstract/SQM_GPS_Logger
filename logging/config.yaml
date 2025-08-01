@@ -1,6 +1,6 @@
 trigger_button_gpio_pin: NONE # GPIO pin for the trigger button, e.g., 23
-sqm_serial_port: "COM3" # Serial port for the SQM device, e.g., COM3 on Windows or /dev/ttyUSB0 on Linux
-gps_serial_port: "COM4" # Serial port for the GPS device, e.g., COM4 on Windows or /dev/ttyUSB1 on Linux
+sqm_serial_port: "COM3" # Serial port for the SQM device, e.g., COM3 on Windows or /dev/seria/by-id/usb-FTDI_FT232R_USB_UART_B003LRZL-if00-port0 on Linux
+gps_serial_port: "COM4" # Serial port for the GPS device, e.g., COM4 on Windows or /dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller_BTDJb116L16-if00-port0 on Linux
 local_timezone: "America/Los_Angeles" # Local timezone from the IANA Time Zone Database
 measurements_per_trigger: 1 # Number of measurements to take per trigger, -1 for continuous mode
 measurement_interval: 0 # Interval between measurements in seconds

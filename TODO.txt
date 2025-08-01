@@ -1,0 +1,5 @@
+TODO: translate the old csv files to the new format
+TODO: create a SQLite database to store the data
+TODO: re-work the map generation to use the SQLite database, and to generate multiple maps per run
+TODO: Use prompt_toolkit for better command line interface (input prompt below live output)
+TODO: look into displays for the device, like a SSD1331, and how to drive them

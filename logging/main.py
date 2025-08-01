@@ -1,40 +1,188 @@
 #!/usr/bin/env python3
+
+
 from csv import DictWriter
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 from gpiozero import Button
-import logging
-from os import fsync, rename, name
+from logging import getLogger, FileHandler, Formatter, Logger, INFO, DEBUG, WARNING, ERROR, CRITICAL
+from os import fsync, rename
 from pathlib import Path
-import pynmea2
+from pynmea2 import parse, ParseError
 from serial import Serial
 from threading import Thread, Event, Lock
 from time import perf_counter, sleep, time
+from typing import Any, Final
 from yaml import safe_load, YAMLError
 from zoneinfo import ZoneInfo
 
 
-# TODO: Get more of the global variables from the config file
-# TODO: Use prompt_toolkit for better command line interface (input prompt below live output)
+# === Class Definitions ===
 
 
-# === CLASS DEFS ===
-
-# Enum to define what happens when the trigger is pressed, either take a single measurement or
-# turn on/off continuous data taking
 class TriggerBehavior(Enum):
+    """ Enum to define what happens when the trigger is pressed,
+    either take a single measurement or turn on/off continuous data taking."""
     SINGLE = auto()  # Trigger a single measurement
     TOGGLE_CONTINUOUS = auto()  # Toggle between CONTINUOUS and STOP
 
-# Wrapper around csv.DictWriter to ensure the file is flushed to disk after each write
+
+class Settings:
+    """ Class to encapsulate the settings for the SQM logger.
+    This class provides thread-safe access to the settings and allows for getting and setting
+    the measurements per trigger, measurement interval, extra measurement flag, and local timezone."""
+
+    def __init__(self,
+                 measurements_per_trigger: int = 1,
+                 measurement_interval: int = 0,
+                 extra_measurement: bool = True,
+                 local_timezone: str = "America/Los_Angeles",
+                 trigger_behavior: TriggerBehavior = TriggerBehavior.SINGLE,
+                 logging_active: bool = False) -> None:
+        self._lock = Lock()
+        self._measurements_per_trigger = measurements_per_trigger
+        self._measurement_interval = measurement_interval
+        self._extra_measurement = extra_measurement
+        self._local_timezone = local_timezone
+        self._trigger_behavior = trigger_behavior
+        self._logging_active = logging_active
+
+    # Getters and setters for the settings
+    def get_measurements_per_trigger(self) -> int:
+        with self._lock:
+            return self._measurements_per_trigger
+
+    def set_measurements_per_trigger(self, value: int) -> None:
+        with self._lock:
+            self._measurements_per_trigger = value
+
+    def get_measurement_interval(self) -> int:
+        with self._lock:
+            return self._measurement_interval
+
+    def set_measurement_interval(self, value: int) -> None:
+        with self._lock:
+            self._measurement_interval = value
+
+    def is_extra_measurement_enabled(self) -> bool:
+        with self._lock:
+            return self._extra_measurement
+
+    def set_extra_measurement(self, value: bool) -> None:
+        with self._lock:
+            self._extra_measurement = value
+
+    def get_local_timezone(self) -> str:
+        with self._lock:
+            return self._local_timezone
+
+    def set_local_timezone(self, value: str) -> None:
+        with self._lock:
+            self._local_timezone = value
+
+    def get_trigger_behavior(self) -> TriggerBehavior:
+        with self._lock:
+            return self._trigger_behavior
+
+    def set_trigger_behavior(self, value: TriggerBehavior) -> None:
+        with self._lock:
+            self._trigger_behavior = value
+
+    def is_logging_active(self) -> bool:
+        with self._lock:
+            return self._logging_active
+
+    def set_logging_active(self, value: bool) -> None:
+        with self._lock:
+            self._logging_active = value
+
+    @property
+    def measurements_per_trigger(self) -> int:
+        return self.get_measurements_per_trigger()
+
+    @measurements_per_trigger.setter
+    def measurements_per_trigger(self, value: int) -> None:
+        self.set_measurements_per_trigger(value)
+
+    @property
+    def measurement_interval(self) -> int:
+        return self.get_measurement_interval()
+
+    @measurement_interval.setter
+    def measurement_interval(self, value: int) -> None:
+        self.set_measurement_interval(value)
+
+    @property
+    def extra_measurement(self) -> bool:
+        return self.is_extra_measurement_enabled()
+
+    @extra_measurement.setter
+    def extra_measurement(self, value: bool) -> None:
+        self.set_extra_measurement(value)
+
+    @property
+    def local_timezone(self) -> str:
+        return self.get_local_timezone()
+
+    @local_timezone.setter
+    def local_timezone(self, value: str) -> None:
+        self.set_local_timezone(value)
+
+    @property
+    def trigger_behavior(self) -> TriggerBehavior:
+        return self.get_trigger_behavior()
+
+    @trigger_behavior.setter
+    def trigger_behavior(self, value: TriggerBehavior) -> None:
+        self.set_trigger_behavior(value)
+
+    @property
+    def logging_active(self) -> bool:
+        return self.is_logging_active()
+
+    @logging_active.setter
+    def logging_active(self, value: bool) -> None:
+        self.set_logging_active(value)
+
+
+@dataclass(frozen=True)
+class GPSReport:
+    """ Class to encapsulate the GPS report data.
+    This class provides a frozen dataclass to ensure immutability of the GPS report data.
+    It contains the UTC time, local time, latitude, longitude, altitude, speed, and number of satellites.
+    """
+    time_utc: str
+    time_local: str
+    latitude: str
+    longitude: str
+    altitude: str
+    speed: str
+    satellites: str
+
+
+@dataclass(frozen=True)
+class SQMReading:
+    """ Class to encapsulate the SQM reading data.
+    This class provides a frozen dataclass to ensure immutability of the SQM reading data.
+    It contains the brightness, frequency, count, period, and temperature.
+    """
+    brightness: str
+    frequency: str
+    count: str
+    period: str
+    temperature: str
+
+
 class SafeDictWriter(DictWriter):
-    def __init__(self, *args, **kwargs):
+    """ Custom DictWriter that flushes the file to disk after each write."""
+    def __init__(self, file_path: Path, logger : Logger, *args, **kwargs):
         try:
-            self.file = open(args[0], "w", newline="", buffering=1)  # The file path is the first argument
-            super().__init__(self.file, *args[1:], **kwargs)
+            self.file = open(file_path, "w", newline="", buffering=1)  # The file path is the first argument
+            self.logger = logger
+            super().__init__(self.file, *args, **kwargs)
         except FileNotFoundError as exc:
-            log.critical(f"Data file not found. Please ensure the data directory exists. Data file path: {args[0]}")
+            self.logger.critical(f"Data file not found. Please ensure the data directory exists. Data file path: {file_path}")
             raise exc
 
     def writeheader(self):
@@ -50,72 +198,26 @@ class SafeDictWriter(DictWriter):
     def close(self):
         self.file.close()
 
-# Custom file handler for logger that flushes to disk after each log entry
-class FlushFileHandler(logging.FileHandler):
+
+class FlushFileHandler(FileHandler):
+    """ Custom FileHandler that flushes the file to disk after each log entry,
+    with thread-safe access to the file stream."""
     def emit(self, record):
         super().emit(record)
         self.flush()
         fsync(self.stream.fileno())
 
-# Encapsulates the GPS report data
-@dataclass(frozen=True)
-class GPSReport:
-    time_utc: str
-    time_local: str
-    latitude: str
-    longitude: str
-    altitude: str
-    speed: str
-    satellites: str
 
-# Encapsulates the SQM response to the "rx" command
-@dataclass(frozen=True)
-class SQMReading:
-    brightness: str
-    frequency: str
-    count: str
-    period: str
-    temperature: str
-
-
-# === GLOBAL CONSTANTS AND VARIABLES ===
-
-
-# Constants
-CONFIG_FILE_PATH = Path(__file__).resolve().parent / "config.yaml"
-DATA_FILE_HEADER = ["trigger_id",
-                    "time_utc",
-                    "time_local",
-                    "latitude",
-                    "longitude",
-                    "altitude",
-                    "speed",
-                    "satellites",
-                    "gps_time",
-                    "sqm_time",
-                    "temperature",
-                    "count",
-                    "frequency",
-                    "brightness"]
-
-# Variables
-DATA_FILE_PATH = "" # Will be renamed with GPS timestamp once GPS fix is acquired
-DIAGNOSTIC_FILE_PATH = Path(__file__).resolve().parent / "diagnostics" / f"temp.log" # Temporary filename, will be renamed with GPS timestamp once GPS fix is acquired
-trigger_id = 0  # Unique ID for each trigger event, incremented on each trigger
-measurements_per_trigger = 1  # Default number of measurements per trigger
-measurement_interval = 0  # Default interval between measurements in seconds
-extra_measurement = True # Flag to indicate if an extra sqm measurement should be taken in order to account for the temperature error
-trigger_behavior = TriggerBehavior.SINGLE
-logging_active = False  # Flag to indicate if logging is active
-logging_lock = Lock()
-logging_event = Event()
-
-
-# === HELPER FUNCTIONS ===
+# === Helper Functions ===
 
 
 # Check if the input is a number
-def is_number(n):
+def is_number(n: Any) -> bool:
+    """ Check if the input can be converted to an integer.
+    :param n: Input to check.
+    :return: True if n is a number, False otherwise.
+    """
+
     try:
         int(n)
         return True
@@ -123,19 +225,16 @@ def is_number(n):
         return False
 
 
-def is_raspberry_pi_os():
-    try:
-        with open("/etc/os-release", "r") as f:
-            return "Raspbian" in f.read() or "Raspberry Pi OS" in f.read()
-    except FileNotFoundError:
-        return False
-
-
-def wait_for_gps_fix(gps_serial, timeout=120):
+def wait_for_gps_fix(gps_serial: Serial, logger: Logger, timeout=120) -> None:
     """
     Waits for a valid GPS fix using GGA sentences.
-    Returns True if fix is obtained within timeout, else False.
+    If a valid fix is obtained, it returns, otherwise it raises an exception after the timeout.
+    :param gps_serial: The serial port connected to the GPS module.
+    :param logger: Logger instance to log messages.
+    :param timeout: Maximum time to wait for a GPS fix in seconds.
+    :raises Exception: If a valid GPS fix is not obtained within the timeout period.
     """
+
     gps_serial.reset_input_buffer()
     start_time = time()
 
@@ -144,75 +243,81 @@ def wait_for_gps_fix(gps_serial, timeout=120):
             line = gps_serial.readline().decode(errors='ignore').strip()
 
             if line.startswith('$GNGGA') or line.startswith('$GPGGA'):
-                msg = pynmea2.parse(line)
+                msg = parse(line)
 
                 fix_quality = int(msg.gps_qual)
-                num_sats = int(msg.num_sats)
+                num_sat = int(msg.num_sats)
 
                 if fix_quality >= 1:
-                    log.info(f"GPS fix obtained, satellites used: {num_sats}")
-                    return True
+                    logger.info(f"GPS fix obtained, satellites used: {num_sat}")
+                    return
                 else:
-                    log.info(f"Waiting for GPS fix... Satellites: {num_sats}, Quality: {fix_quality}")
+                    logger.info(f"Waiting for GPS fix... Satellites: {num_sat}, Quality: {fix_quality}")
 
-        except pynmea2.ParseError:
+        except ParseError:
             continue
         except Exception as ex:
-            log.critical(f"Unexpected error while waiting for GPS fix: {ex}")
+            logger.critical(f"Unexpected error while waiting for GPS fix: {ex}")
             raise ex
 
         sleep(1)  # Avoid hammering the CPU
 
-    log.critical("GPS fix not acquired.")
+    logger.critical("GPS fix not acquired.")
     raise Exception("GPS fix not acquired")
-
 
 # This function reads two NMEA sentences from the GPS: GNGGA and GNRMC.
 # It returns a GPSReport object containing the parsed data.
-def get_gps_data():
+def get_gps_data(gps_serial: Serial, logger: Logger, local_tz: str) -> GPSReport:
+    """ Reads GPS data from the serial port and returns a GPSReport object.
+    :param gps_serial: The serial port connected to the GPS module.
+    :param logger: Logger instance to log messages.
+    :param local_tz: The local timezone to convert the UTC time to.
+    :return: A GPSReport object containing the parsed GPS data.
+    """
+
     date_utc = None
     time_utc = None
     lat = None
     lon = None
     alt = None
     speed = None
-    num_sats = None
+    num_sat = None
 
     got_gga = False
     got_rmc = False
 
-    gps.reset_input_buffer()
+    gps_serial.reset_input_buffer()
 
     while True:
         try:
-            line = gps.readline().decode().strip()
+            line = gps_serial.readline().decode().strip()
         except UnicodeDecodeError as exc:
-            log.error(f"Error decoding GPS data: {exc}")
+            logger.error(f"Error decoding GPS data: {exc}")
             continue
         except Exception as exc:
-            log.critical(f"Unexpected error reading GPS data: {exc}")
+            logger.critical(f"Unexpected error reading GPS data: {exc}")
             raise exc
 
         # Support both NMEA and regular GPS sentences
         if line.startswith('$GNGGA') or line.startswith('$GPGGA'):
             try:
-                msg = pynmea2.parse(line)
+                msg = parse(line)
                 lat = msg.latitude
                 lon = msg.longitude
                 alt = msg.altitude
-                num_sats = msg.num_sats
+                num_sat = msg.num_sats
                 time_utc = msg.timestamp
                 got_gga = True
-            except pynmea2.ParseError:
+            except ParseError:
                 continue
 
         elif line.startswith('$GNRMC') or line.startswith('$GPRMC'):
             try:
-                msg = pynmea2.parse(line)
+                msg = parse(line)
                 date_utc = msg.datestamp
                 speed = msg.spd_over_grnd  # knots
                 got_rmc = True
-            except pynmea2.ParseError:
+            except ParseError:
                 continue
 
         # If both sentences have been parsed, return the data
@@ -221,320 +326,372 @@ def get_gps_data():
 
             return GPSReport(
                 time_utc=dt_utc.strftime("%Y-%m-%dT%H:%M:%S"),
-                time_local=(dt_utc.astimezone(ZoneInfo(config_file.get("local_timezone")))).strftime("%Y-%m-%dT%H:%M:%S"),
+                time_local=(dt_utc.astimezone(ZoneInfo(local_tz))).strftime("%Y-%m-%dT%H:%M:%S"),
                 latitude=lat,
                 longitude=lon,
                 altitude=alt,
                 speed=speed,
-                satellites=num_sats)
+                satellites=num_sat)
 
+def get_sqm_data(sqm_serial: Serial, logger: Logger) -> SQMReading:
+    """ Reads a reading from the SQM serial port and returns a SQMReading object.
+    :param sqm_serial: The serial port connected to the SQM device.
+    :param logger: Logger instance to log messages.
+    :return: A SQMReading object containing the parsed SQM data.
+    """
 
-def get_sqm_reading() -> SQMReading:
-    sqm.reset_input_buffer()
+    sqm_serial.reset_input_buffer()
 
+    # The "rx" command is used to request a reading from the SQM
     try:
-        sqm.write(b"rx")
+        sqm_serial.write(b"rx")
     except Exception as exc:
-        log.critical(f"Unexpected error sending command to SQM: {exc}")
+        logger.critical(f"Unexpected error sending command to SQM: {exc}")
         raise exc
 
     try:
-        response = sqm.readline().decode().strip()
+        response = sqm_serial.readline().decode().strip()
     except UnicodeDecodeError as exc:
-        log.critical(f"Error decoding SQM response: {exc}")
+        logger.critical(f"Error decoding SQM response: {exc}")
         raise exc
     except Exception as exc:
-        log.critical(f"Unexpected error reading SQM response: {exc}")
+        logger.critical(f"Unexpected error reading SQM response: {exc}")
         raise exc
 
-    return SQMReading(brightness=response[3:9],
-                      frequency=response[10:22],
-                      count=response[23:34],
-                      period=response[35:47],
-                      temperature=response[49:55])
+    return SQMReading(brightness=response[2:8],
+                      frequency=response[10:20],
+                      count=response[23:33],
+                      period=response[35:46],
+                      temperature=response[49:54])
 
-
-def toggle_trigger_behavior():
-    """Toggle the trigger behavior between SINGLE and TOGGLE_CONTINUOUS."""
-    global trigger_behavior
-
-    with logging_lock:
-        if trigger_behavior == TriggerBehavior.SINGLE:
-            trigger_behavior = TriggerBehavior.TOGGLE_CONTINUOUS
-            log.info("Trigger behavior set to toggle continuous mode.")
-        else:
-            trigger_behavior = TriggerBehavior.SINGLE
-            log.info("Trigger behavior set to single measurement.")
-        print(f"Trigger behavior set to {trigger_behavior.name}.")
-
-
-def log_measurement():
-    global data_file_writer, trigger_id
-
-    with logging_lock:
-        tr_id = trigger_id
+def log_measurement(sqm_serial: Serial,
+                    gps_serial: Serial,
+                    data_file_writer: SafeDictWriter,
+                    trigger_id: int,
+                    measurement_id: int,
+                    logger: Logger,
+                    settings: Settings) -> None:
+    """ Logs a single measurement by reading from the SQM and GPS, and writing to the data file.
+    :param sqm_serial: The serial port connected to the SQM device.
+    :param gps_serial: The serial port connected to the GPS module.
+    :param data_file_writer: The CSV writer for the data file.
+    :param trigger_id: The unique ID for the trigger event.
+    :param measurement_id: The unique ID for the measurement within the trigger event.
+    :param logger: Logger instance to log messages.
+    :param settings: Settings instance containing the configuration for the logger.
+    """
 
     start_time = perf_counter()
-    gps_report = get_gps_data()
+    gps_report = get_gps_data(gps_serial, logger, settings.local_timezone)
     end_gps_time = perf_counter()
-    sqm_reading = get_sqm_reading()
+    sqm_reading = get_sqm_data(sqm_serial, logger)
     end_sqm_time = perf_counter()
-    data = {"trigger_id" : tr_id,
+    data = {"brightness" : sqm_reading.brightness,
+            "count" : sqm_reading.count,
+            "frequency": sqm_reading.frequency,
+            "period" : sqm_reading.period,
+            "temperature" : sqm_reading.temperature,
             "time_utc" : gps_report.time_utc,
             "time_local" : gps_report.time_local,
-            "latitude" : gps_report.latitude,
-            "longitude" : gps_report.longitude,
+            "latitude" : f"{round(float(gps_report.latitude), 5)}",
+            "longitude" : f"{round(float(gps_report.longitude), 5)}",
             "altitude" : gps_report.altitude,
             "speed" : gps_report.speed,
             "satellites" : gps_report.satellites,
-            "gps_time" : f"{(end_gps_time - start_time):.4f}",
-            "sqm_time" : f"{(end_sqm_time - end_gps_time):.4f}",
-            "temperature" : sqm_reading.temperature,
-            "count" : sqm_reading.count,
-            "frequency" : sqm_reading.frequency,
-            "brightness" : sqm_reading.brightness}
+            "trigger_id": str(trigger_id).zfill(5),
+            "measurement_id": str(measurement_id).zfill(3),
+            "gps_time": f"{round((end_gps_time - start_time), 4)}",
+            "sqm_time": f"{round((end_sqm_time - end_gps_time), 4)}"}
 
     data_file_writer.writerow(data)
-    log.info(f"Logged SQM & GPS data.")
+    logger.info(f"Logged SQM & GPS data.")
 
+# TODO: re-examine the inner while loop, I feel like it is not needed, or could be done differently
+# TODO: check the logic in the continuous mode, it may never exit the inner loop
+def logging_worker(sqm_serial: Serial,
+                   gps_serial: Serial,
+                   data_file_writer: SafeDictWriter,
+                   logger: Logger,
+                   settings: Settings,
+                   logging_event: Event) -> None:
+    """ Worker thread that handles the logging of SQM readings and GPS data.
+    :param sqm_serial: The serial port connected to the SQM device.
+    :param gps_serial: The serial port connected to the GPS module.
+    :param data_file_writer: The CSV writer for the data file.
+    :param logger: Logger instance to log messages.
+    :param settings: Settings instance containing the configuration for the logger.
+    :param logging_event: Event to trigger the logging process.
+    """
 
-def logging_worker():
-    global logging_active, extra_measurement, measurements_per_trigger, measurement_interval, trigger_behavior, trigger_id
-    while True:
-        logging_event.wait()
+    try:
+        # Thread initialization
+        logging_event.clear()
+        data_file_writer.writeheader()  # Write the header to the file
+        trigger_id = 0  # Unique ID for each trigger event, incremented on each trigger
 
         while True:
-            with logging_lock:
-                la = logging_active
-                em = extra_measurement
-                mpt = measurements_per_trigger
-                mi = measurement_interval
-                tb = trigger_behavior
+            logging_event.wait()
+            logging_event.clear()  # Clear the event to wait for the next trigger
+            settings.logging_active = True
+            measurement_id = 0  # Unique ID for each measurement within a trigger event
 
-            if not la:
-                break
+            while True:
+                # If extra measurement is enabled, take an additional SQM reading before the main measurements
+                # to account for temperature error
+                if settings.extra_measurement:
+                    _ = get_sqm_data(sqm_serial, logger)
 
-            if em: # If extra measurement is enabled, take an additional SQM reading before the main measurements
-                _ = get_sqm_reading()
+                for _ in range(settings.measurements_per_trigger):
+                    log_measurement(sqm_serial, gps_serial, data_file_writer, trigger_id, measurement_id, logger, settings)
+                    measurement_id += 1
+                    sleep(settings.measurement_interval)
 
-            for _ in range(mpt):
-                log_measurement()
-                sleep(mi)
-
-            with logging_lock:
                 trigger_id += 1
 
-            if tb == TriggerBehavior.SINGLE:
-                with logging_lock:
-                    logging_active = False
-                break
+                # if the mode is set to SINGLE, or if TOGGLE_CONTINUOUS and the logging_event was set again, exit
+                if settings.trigger_behavior == TriggerBehavior.SINGLE or (settings.trigger_behavior == TriggerBehavior.TOGGLE_CONTINUOUS and logging_event.is_set()):
+                    break
 
-        logging_event.clear()
-
-
-def handle_trigger():
-    global trigger_behavior, logging_active
-
-    with logging_lock:
-        if trigger_behavior == TriggerBehavior.SINGLE:
-            logging_active = True
-            logging_event.set()
-        elif trigger_behavior == TriggerBehavior.TOGGLE_CONTINUOUS:
-            logging_active = not logging_active
-            logging_event.set()
-
-
-# === SETUP ===
-
-
-# Set up the logger
-log = logging.getLogger("SQM Logger")
-log.setLevel(logging.INFO) # Default to INFO level, will be changed later based on config file
-log_handler = FlushFileHandler(DIAGNOSTIC_FILE_PATH, mode="w")
-log_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(funcName)s - %(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
-log_handler.setFormatter(log_formatter)
-log.addHandler(log_handler)
-
-# Open the configuration file
-try:
-    with open(CONFIG_FILE_PATH, "r") as rpi_conf_file:
-        config_file = safe_load(rpi_conf_file)
-    log.info("Successfully loaded configuration file")
-except FileNotFoundError:
-    log.critical(f"{CONFIG_FILE_PATH} not found. Please ensure the configuration file exists.")
-except YAMLError as e:
-    log.critical(f"Error parsing config.yaml: {e}")
-except Exception as e:
-    log.critical(f"Unexpected error reading config.yaml: {e}")
-
-# Set the logging level based on the configuration file
-logging_level = config_file.get("logging_level", "INFO").upper()
-if logging_level == "DEBUG":
-    log.setLevel(logging.DEBUG)
-    log_handler.setLevel(logging.DEBUG)
-    log.debug("Log level set to DEBUG based on configuration file")
-elif logging_level == "INFO":
-    log.setLevel(logging.INFO)
-    log_handler.setLevel(logging.INFO)
-    log.info("Log level set to INFO based on configuration file")
-elif logging_level == "WARNING":
-    log.setLevel(logging.WARNING)
-    log_handler.setLevel(logging.WARNING)
-    log.warning("Log level set to WARNING based on configuration file")
-elif logging_level == "ERROR":
-    log.setLevel(logging.ERROR)
-    log_handler.setLevel(logging.ERROR)
-    log.error("Log level set to ERROR based on configuration file")
-elif logging_level == "CRITICAL":
-    log.setLevel(logging.CRITICAL)
-    log_handler.setLevel(logging.CRITICAL)
-    log.critical("Log level set to CRITICAL based on configuration file")
-
-# Set the measurements per trigger based on the configuration file
-measurements_per_trigger = config_file.get("measurements_per_trigger", 1)
-log.info(f"Measurements per trigger set to {measurements_per_trigger} based on configuration file")
-
-# Set the measurements interval based on the configuration file
-measurement_interval = config_file.get("measurement_interval")
-log.info(f"Measurements interval set to {measurement_interval} seconds based on configuration file")
-
-# Initialize the button trigger (only on raspberry pi)
-if config_file.get("trigger_button_gpio_pin") != "NONE":
-    try:
-        button = Button(config_file.get("trigger_button_gpio_pin"), pull_up=True, bounce_time=0.25)
-        button.when_pressed = lambda: handle_trigger()
-        log.info(f"Successfully initialized button on GPIO pin {config_file.get('trigger_button_gpio_pin')}")
-    except ValueError as e:
-        log.error(f"Invalid GPIO pin number: {config_file.get('trigger_button_gpio_pin')}. Please check the configuration file. Error: {e}")
+            settings.logging_active = False
+            logging_event.clear()
     except Exception as e:
-        log.error(f"Error initializing button: {e}")
-
-# Initialize the SQM serial port
-try:
-    sqm = Serial(config_file.get("sqm_serial_port"), baudrate=115200, timeout=30)
-    sqm.flush()  # Clear any existing data in the input buffer
-    log.info(f"Successfully opened SQM serial port {config_file.get('sqm_serial_port')}")
-except Exception as e:
-    log.critical(f"Unexpected error opening SQM serial port: {e}")
-    raise e
-
-# Initialize the GPS serial port
-try:
-    gps = Serial(config_file.get("gps_serial_port"), baudrate=4800, timeout=2)
-    log.info(f"Successfully opened GPS serial port {config_file.get('gps_serial_port')}")
-except Exception as e:
-    log.critical(f"Unexpected error opening GPS serial port: {e}")
-    raise e
-
-# Wait for GPS fix before starting measurements
-wait_for_gps_fix(gps, 120)
-
-# Get the GPS data to set the start time for file naming
-try:
-    program_start_time = get_gps_data().time_local.replace(":", "-").replace("T", "_")
-    log.info(f"Start time is {program_start_time}")
-except Exception as e:
-    log.critical(f"Error getting GPS data for start time: {e}")
-    raise e
-
-# Rename the data file path
-try:
-    # The data file hasn't been created yet, so just set the path to the new name
-    new_datafile_path = Path(__file__).resolve().parent / "data" / f"{program_start_time}.csv"
-    DATA_FILE_PATH = new_datafile_path
-    log.info(f"Data file path created: {DATA_FILE_PATH}")
-except Exception as e:
-    log.critical(f"Error setting new data file path: {e}")
-    raise e
-
-# Rename the diagnostic file path
-try:
-    new_diagnostic_file_path = Path(__file__).resolve().parent / "diagnostics" / f"{program_start_time}.log"
-
-    # Close the old handler and rename the file
-    log.removeHandler(log_handler)
-    log_handler.close()
-
-    # Rename the diagnostic file
-    rename(DIAGNOSTIC_FILE_PATH, new_diagnostic_file_path)
-    DIAGNOSTIC_FILE_PATH = new_diagnostic_file_path
-
-    # Recreate the handler with the new file path
-    log_handler = FlushFileHandler(DIAGNOSTIC_FILE_PATH, mode="a")
-    log_handler.setFormatter(log_formatter)
-    log.addHandler(log_handler)
-
-    log.info(f"Successfully renamed diagnostic file using GPS timestamp: {DIAGNOSTIC_FILE_PATH}")
-except Exception as e:
-    log.critical(f"Error renaming data or diagnostic file: {e}")
-    raise e
-
-# Open the csv data file writer
-try:
-    data_file_writer = SafeDictWriter(DATA_FILE_PATH,
-                                      delimiter=',',
-                                      fieldnames=DATA_FILE_HEADER)
-    data_file_writer.writeheader()  # Write the header to the file
-    log.info("Successfully opened data file")
-except Exception as e:
-    log.critical(f"Error opening data file {DATA_FILE_PATH}: {e}")
-    raise e
+        logger.critical(f"Unexpected error in logging worker thread: {e}")
+        raise e
 
 
-# === THREADING / TRIGGER SETUP ===
-
-
-logging_thread = Thread(target=logging_worker)
-logging_thread.daemon = True  # Ensure the thread exits when the main program exits
-logging_thread.start()
-
-
-# === MAIN FUNCTION ===
+# === Entry Point ===
 
 
 def main():
-    global measurement_interval, measurements_per_trigger, trigger_behavior, extra_measurement
+    # Constants
+    CONFIG_FILE_PATH: Final = Path(__file__).resolve().parent / "config.yaml" # config file should be in the same directory as this script
+    DATA_FILE_HEADER: Final = ["brightness",
+                               "count",
+                               "frequency",
+                               "period",
+                               "temperature",
+                               "time_utc",
+                               "time_local",
+                               "latitude",
+                               "longitude",
+                               "altitude",
+                               "speed",
+                               "satellites",
+                               "trigger_id",
+                               "measurement_id",
+                               "gps_time",
+                               "sqm_time"]
+
+    # Variables
+    logging_event = Event()
+    settings = Settings()
+    diagnostic_file_path = Path(__file__).resolve().parent / "diagnostics" / f"temp.log"  # Temporary filename, will be renamed with GPS timestamp once GPS fix is acquired
+
+    # Construct logger
+    log = getLogger("SQMLogger")
+    log.setLevel(INFO)  # Default to INFO level, will be changed later based on config file
+    log_handler = FlushFileHandler(diagnostic_file_path, mode="w")
+    log_formatter = Formatter("%(asctime)s - %(levelname)s - %(funcName)s - %(message)s",
+                                      datefmt="%Y-%m-%dT%H:%M:%S")
+    log_handler.setFormatter(log_formatter)
+    log.addHandler(log_handler)
+
+    # Open the configuration file
+    try:
+        with open(CONFIG_FILE_PATH, "r") as rpi_conf_file:
+            config_file = safe_load(rpi_conf_file)
+        log.info("Successfully loaded configuration file")
+    except FileNotFoundError:
+        log.critical(f"{CONFIG_FILE_PATH} not found. Please ensure the configuration file exists.")
+    except YAMLError as e:
+        log.critical(f"Error parsing config.yaml: {e}")
+    except Exception as e:
+        log.critical(f"Unexpected error reading config.yaml: {e}")
+
+    # Set the measurements per trigger based on the configuration file
+    settings.measurements_per_trigger = config_file.get("measurements_per_trigger", 1)
+    log.info(f"Measurements per trigger set to {settings.measurements_per_trigger} based on configuration file")
+
+    # Set the measurements interval based on the configuration file
+    settings.measurement_interval = config_file.get("measurement_interval", 0)
+    log.info(f"Measurements interval set to {settings.measurement_interval} seconds based on configuration file")
+
+    # Set the extra measurement flag based on the configuration file
+    settings.extra_measurement = config_file.get("extra_measurement", True)
+    log.info(f"Extra measurement set to {'enabled' if settings.extra_measurement else 'disabled'} based on configuration file")
+
+    # Set the local timezone based on the configuration file
+    settings.local_timezone = config_file.get("local_timezone", "America/Los_Angeles")
+    log.info(f"Local timezone set to {settings.local_timezone} based on configuration file")
+
+    # Set the trigger behavior based on the configuration file
+    trigger_behavior_str = config_file.get("trigger_behavior", "SINGLE").upper()
+    if trigger_behavior_str == "SINGLE":
+        settings.trigger_behavior = TriggerBehavior.SINGLE
+        log.info("Trigger behavior set to SINGLE based on configuration file")
+    elif trigger_behavior_str == "TOGGLE_CONTINUOUS":
+        settings.trigger_behavior = TriggerBehavior.TOGGLE_CONTINUOUS
+        log.info("Trigger behavior set to TOGGLE_CONTINUOUS based on configuration file")
+    else:
+        log.error(f"Invalid trigger behavior '{trigger_behavior_str}' in configuration file. Defaulting to SINGLE.")
+        settings.trigger_behavior = TriggerBehavior.SINGLE
+
+    # Set the logging level based on the configuration file
+    logging_level = config_file.get("logging_level", "INFO").upper()
+    if logging_level == "DEBUG":
+        log.setLevel(DEBUG)
+        log_handler.setLevel(DEBUG)
+        log.debug("Log level set to DEBUG based on configuration file")
+    elif logging_level == "INFO":
+        log.setLevel(INFO)
+        log_handler.setLevel(INFO)
+        log.info("Log level set to INFO based on configuration file")
+    elif logging_level == "WARNING":
+        log.setLevel(WARNING)
+        log_handler.setLevel(WARNING)
+        log.warning("Log level set to WARNING based on configuration file")
+    elif logging_level == "ERROR":
+        log.setLevel(ERROR)
+        log_handler.setLevel(ERROR)
+        log.error("Log level set to ERROR based on configuration file")
+    elif logging_level == "CRITICAL":
+        log.setLevel(CRITICAL)
+        log_handler.setLevel(CRITICAL)
+        log.critical("Log level set to CRITICAL based on configuration file")
+    else:
+        log.error(f"Invalid logging level '{logging_level}' in configuration file. Defaulting to INFO.")
+        log.setLevel(INFO)
+        log_handler.setLevel(INFO)
+
+    # Initialize the button trigger (only on raspberry pi)
+    if config_file.get("trigger_button_gpio_pin") != "NONE":
+        try:
+            button = Button(config_file.get("trigger_button_gpio_pin"), pull_up=True, bounce_time=0.25)
+            button.when_pressed = lambda: logging_event.set()
+            log.info(f"Successfully initialized button on GPIO pin {config_file.get('trigger_button_gpio_pin')}")
+        except ValueError as e:
+            log.error(
+                f"Invalid GPIO pin number: {config_file.get('trigger_button_gpio_pin')}. Please check the configuration file. Error: {e}")
+        except Exception as e:
+            log.error(f"Error initializing button: {e}")
+
+    # Initialize the SQM serial port
+    try:
+        sqm = Serial(config_file.get("sqm_serial_port"), baudrate=115200, timeout=30)
+        log.info(f"Successfully opened SQM serial port {config_file.get('sqm_serial_port')}")
+    except Exception as e:
+        log.critical(f"Unexpected error opening SQM serial port: {e}")
+        raise e
+
+    # Initialize the GPS serial port
+    try:
+        gps = Serial(config_file.get("gps_serial_port"), baudrate=4800, timeout=2)
+        log.info(f"Successfully opened GPS serial port {config_file.get('gps_serial_port')}")
+    except Exception as e:
+        log.critical(f"Unexpected error opening GPS serial port: {e}")
+        raise e
+
+    # Wait for GPS fix before starting measurements
+    wait_for_gps_fix(gps, log, 180)
+
+    # Get the GPS data to set the start time for file naming
+    try:
+        program_start_time = get_gps_data(gps, log, settings.local_timezone).time_local.replace(":", "-").replace("T", "_")
+        log.info(f"Start time is {program_start_time}")
+    except Exception as e:
+        log.critical(f"Error getting GPS data for start time: {e}")
+        raise e
+
+    # Rename the data file path
+    try:
+        # The data file hasn't been created yet, so just set the path to the new name
+        new_datafile_path = Path(__file__).resolve().parent / "data" / f"{program_start_time}.csv"
+        data_file_path = new_datafile_path
+        log.info(f"Data file path created: {data_file_path}")
+    except Exception as e:
+        log.critical(f"Error setting new data file path: {e}")
+        raise e
+
+    # Rename the diagnostic file path
+    try:
+        new_diagnostic_file_path = Path(__file__).resolve().parent / "diagnostics" / f"{program_start_time}.log"
+
+        # Close the old handler and rename the file
+        log.removeHandler(log_handler)
+        log_handler.close()
+
+        # Rename the diagnostic file
+        rename(diagnostic_file_path, new_diagnostic_file_path)
+        diagnostic_file_path = new_diagnostic_file_path
+
+        # Recreate the handler with the new file path
+        log_handler = FlushFileHandler(diagnostic_file_path, mode="a")
+        log_handler.setFormatter(log_formatter)
+        log.addHandler(log_handler)
+
+        log.info(f"Successfully renamed diagnostic file using GPS timestamp: {diagnostic_file_path}")
+    except Exception as e:
+        log.critical(f"Error renaming data or diagnostic file: {e}")
+        raise e
+
+    # Open the csv data file writer
+    try:
+        data_file_writer = SafeDictWriter(data_file_path,
+                                          logger=log,
+                                          delimiter=',',
+                                          fieldnames=DATA_FILE_HEADER)
+        log.info("Successfully opened data file")
+    except Exception as e:
+        log.critical(f"Error opening data file {data_file_path}: {e}")
+        raise e
+
+    # Spawn measurement thread
+    logging_thread = Thread(target=logging_worker,
+                            args=(sqm, gps, data_file_writer, log, settings, logging_event),
+                            name="LoggingWorkerThread",
+                            daemon=True)
+    logging_thread.start()
+
+    # Main loop to handle cli commands and triggers
     try:
         while True:
             cmd = input("Enter command: ")
             if cmd.strip().lower() == 't': # t for trigger
-                handle_trigger()
+                logging_event.set()
             elif cmd.strip().lower() == 'm': # m for mode switch
-                toggle_trigger_behavior()
+                if settings.trigger_behavior == TriggerBehavior.SINGLE:
+                    settings.trigger_behavior = TriggerBehavior.TOGGLE_CONTINUOUS
+                    log.info("Trigger behavior set to TOGGLE_CONTINUOUS")
+                else:
+                    settings.trigger_behavior = TriggerBehavior.SINGLE
+                    log.info("Trigger behavior set to SINGLE")
             elif cmd.strip().lower() == 'x': # x for extra measurement
-                with logging_lock:
-                    extra_measurement = not extra_measurement
-                    log.info(f"Extra measurement set to {'enabled' if extra_measurement else 'disabled'}")
-                    print(f"Extra measurement {'enabled' if extra_measurement else 'disabled'}")
+                settings.extra_measurement = not settings.extra_measurement
+                log.info(f"Extra measurement set to {'enabled' if settings.extra_measurement else 'disabled'}")
             elif cmd.strip().lower() == 'q':
                 log.info("User requested to quit the program.")
                 print("Exiting program...")
                 break
             elif cmd.strip().lower().startswith('n') and is_number(cmd.strip()[1:]):
-                with logging_lock:
-                    measurements_per_trigger = int(cmd.strip()[1:])
-                    log.info(f"User set measurements per trigger to {measurements_per_trigger}")
-                    print(f"Measurements per trigger set to {measurements_per_trigger}")
+                settings.measurements_per_trigger = int(cmd.strip()[1:])
+                log.info(f"User set measurements per trigger to {settings.measurements_per_trigger}")
             elif cmd.strip().lower().startswith('i') and is_number(cmd.strip()[1:]) and int(cmd.strip()[1:]) >= 0:
-                with logging_lock:
-                    measurement_interval = int(cmd.strip()[1:])
-                    log.info(f"User set measurements interval to {measurement_interval} seconds")
-                    print(f"Measurements interval set to {measurement_interval} seconds")
+                settings.measurement_interval = int(cmd.strip()[1:])
+                log.info(f"User set measurements interval to {settings.measurement_interval} seconds")
             elif cmd.strip().lower().startswith('data') and is_number(cmd.strip()[4:]): # Print the last N lines of the data file
-                with open(DATA_FILE_PATH, "r", newline="") as read_file:
+                with open(data_file_path, "r", newline="") as read_file:
                     lines = "".join(read_file.readlines()[-int(cmd.strip()[4:]):]).replace(",", ", ")
                 print(lines)
             elif cmd.strip().lower().startswith('diag') and is_number(cmd.strip()[4:]): # Print the last N lines of the data file
-                with open(DIAGNOSTIC_FILE_PATH, "r", newline="") as read_file:
+                with open(diagnostic_file_path, "r", newline="") as read_file:
                     lines = "".join(read_file.readlines()[-int(cmd.strip()[4:]):]).replace(",", ", ")
                 print(lines)
             elif cmd.strip().lower() == 's': # s for settings
-                with logging_lock:
-                    print(f"Measurements per trigger: {measurements_per_trigger}\n"
-                          f"Measurement interval: {measurement_interval} seconds\n"
-                          f"Extra measurement: {'Yes' if extra_measurement else 'No'}\n"
-                          f"Trigger behavior mode: {trigger_behavior}\n"
-                          f"Currently logging: {'Yes' if logging_event.is_set() else 'No'}")
+                print(f"Measurements per trigger: {settings.measurements_per_trigger}\n"
+                      f"Measurement interval: {settings.measurement_interval} seconds\n"
+                      f"Extra measurement: {'Yes' if settings.extra_measurement else 'No'}\n"
+                      f"Trigger behavior mode: {settings.trigger_behavior}\n"
+                      f"Currently logging: {'Yes' if logging_event.is_set() else 'No'}")
             else:
                 print("Unknown command. Use one of the following:\n"
                       "t - trigger measurement\n"
@@ -554,6 +711,7 @@ def main():
         sqm.close()
         log.info("Closed GPS & SQM serial ports, and data file.")
         log.info("Program terminated.")
+        log_handler.close()
 
 
 if __name__ == "__main__":
